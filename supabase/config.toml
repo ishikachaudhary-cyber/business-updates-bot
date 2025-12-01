@@ -1,0 +1,7 @@
+project_id = "vxwrtbfjgkjfrgkkepej"
+
+[functions.addToSheet]
+verify_jwt = true
+
+[functions.ask]
+verify_jwt = false
