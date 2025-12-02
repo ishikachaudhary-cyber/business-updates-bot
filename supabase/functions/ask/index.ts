@@ -89,20 +89,39 @@ Updates:
 
 ${updatesContext}`;
 
-    // --- Build a simple answer without LLM ---
-    if (!updates || updates.length === 0) {
+    const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY');
+    if (!GEMINI_API_KEY) {
+      console.error('Gemini API key missing');
       return new Response(
-        JSON.stringify({ answer: 'No update found for that date or topic.' }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        JSON.stringify({ error: 'Gemini API key is not configured on the server.' }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    const top = updates.slice(0, 5).map((u, idx) => {
-      const dateStr = u.date ? new Date(u.date).toISOString().slice(0, 10) : 'N/A';
-      return `${idx + 1}. ${u.title} (${dateStr} ${u.time || ''})\n${u.description}`;
-    }).join('\n\n');
+    // --- Call Gemini API ---
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: `${systemPrompt}\n\nUser question: ${question}` }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 500 }
+        })
+      }
+    );
 
-    const answer = top || 'No update found for that date or topic.';
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Gemini API error:', errorText);
+      return new Response(
+        JSON.stringify({ error: `Failed to get AI response from Gemini. ${errorText || ''}`.trim() }),
+        { status: response.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const data = await response.json();
+    const answer = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response generated.';
 
     return new Response(JSON.stringify({ answer }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
