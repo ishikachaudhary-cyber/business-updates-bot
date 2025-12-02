@@ -24,7 +24,8 @@ serve(async (req) => {
 
     // --- Initialize Supabase client ---
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? Deno.env.get('SUPABASE_ANON_KEY');
+    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+    const fallbackKey = Deno.env.get('SUPABASE_ANON_KEY');
 
     if (!supabaseUrl || !supabaseKey) {
       console.error('Supabase environment variables missing');
@@ -34,7 +35,8 @@ serve(async (req) => {
       );
     }
 
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    // Prefer service role for unrestricted read; fall back to anon if provided
+    const supabase = createClient(supabaseUrl, supabaseKey || fallbackKey);
 
     // --- Helpers for date & keyword extraction ---
     const normalizedQuestion = question.toLowerCase();
@@ -167,9 +169,24 @@ serve(async (req) => {
       dbError = fallback.error || null;
     }
 
+    // If a DB error happened, try a last-resort simple fetch before failing
     if (dbError) {
-      console.error('Database error:', dbError);
-      throw new Error('Failed to fetch updates');
+      console.error('Database error, attempting simple fallback:', dbError);
+      const simple = await supabase
+        .from('updates')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(50);
+      if (!simple.error) {
+        updates = simple.data || [];
+        dbError = null;
+      } else {
+        console.error('Simple fallback also failed:', simple.error);
+        return new Response(
+          JSON.stringify({ error: 'Failed to fetch updates' }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
     }
 
     // --- If nothing, return fallback message early ---
