@@ -36,89 +36,43 @@ serve(async (req) => {
 
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // --- Helpers for date & keyword extraction ---
+    // --- Fetch relevant updates (date-aware search with fallback) ---
     const normalizedQuestion = question.toLowerCase();
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const isTodayQuery = normalizedQuestion.includes('today');
+    const targetDate = isTodayQuery ? todayStr : null;
 
-    const toDateString = (d: Date) => d.toISOString().slice(0, 10);
-    const today = new Date();
-    const relativeDates: Record<string, string> = {
-      today: toDateString(today),
-      tomorrow: toDateString(new Date(today.getTime() + 24 * 60 * 60 * 1000)),
-      yesterday: toDateString(new Date(today.getTime() - 24 * 60 * 60 * 1000)),
-    };
-
-    const parseDates = (q: string) => {
-      const dates = new Set<string>();
-      // relative words
-      Object.entries(relativeDates).forEach(([word, dateStr]) => {
-        if (q.includes(word)) dates.add(dateStr);
-      });
-      // YYYY-MM-DD or YYYY/MM/DD
-      const isoMatch = q.match(/(\d{4})[-/](\d{2})[-/](\d{2})/);
-      if (isoMatch) {
-        const [_, y, m, d] = isoMatch;
-        dates.add(`${y}-${m}-${d}`);
-      }
-      // DD-MM-YYYY or DD/MM/YYYY
-      const dmyMatch = q.match(/(\d{2})[-/](\d{2})[-/](\d{4})/);
-      if (dmyMatch) {
-        const [_, d, m, y] = dmyMatch;
-        dates.add(`${y}-${m}-${d}`);
-      }
-      return Array.from(dates);
-    };
-
-    const keywords = normalizedQuestion
+    const keywords = question
+      .toLowerCase()
       .split(/[^a-z0-9]+/g)
       .filter(k => k.length > 2);
-
-    const sanitizeTsQuery = (q: string) => q.replace(/[':]/g, ' ').trim();
-    const tsQuery = sanitizeTsQuery(question);
-
-    const dateCandidates = parseDates(normalizedQuestion);
 
     let updates: any[] = [];
     let dbError: any = null;
 
-    // Primary: date-specific text search
-    if (dateCandidates.length) {
-      for (const targetDate of dateCandidates) {
-        let query = supabase
-          .from('updates')
-          .select('*')
-          .eq('date', targetDate)
-          .order('created_at', { ascending: false })
-          .limit(50);
-
-        if (tsQuery) {
-          query = query.textSearch('search', tsQuery, { type: 'plain', config: 'english' });
-        }
-
-        const { data, error } = await query;
-        if (error) {
-          dbError = error;
-          break;
-        }
-        if (data && data.length > 0) {
-          updates = data;
-          break;
-        }
-      }
+    // Primary: date-specific query (e.g., "today")
+    if (targetDate) {
+      const { data, error } = await supabase
+        .from('updates')
+        .select('*')
+        .eq('date', targetDate)
+        .order('created_at', { ascending: false })
+        .limit(25);
+      updates = data || [];
+      dbError = error;
     }
 
-    // If no date or no results, try text search without date
-    if ((dateCandidates.length === 0 || updates.length === 0) && !dbError) {
+    // If no date or no results, try keyword search
+    if ((!targetDate || updates.length === 0) && !dbError) {
       let updatesQuery = supabase
         .from('updates')
         .select('*')
         .order('created_at', { ascending: false })
-        .limit(50);
+        .limit(25);
 
-      if (tsQuery) {
-        updatesQuery = updatesQuery.textSearch('search', tsQuery, { type: 'plain', config: 'english' });
-      } else if (keywords.length) {
+      if (keywords.length) {
         const keywordFilters = keywords
-          .slice(0, 6)
+          .slice(0, 6) // cap to avoid huge OR clause
           .map(k => `title.ilike.%${k}%,description.ilike.%${k}%`)
           .join(',');
         updatesQuery = updatesQuery.or(keywordFilters);
@@ -135,7 +89,7 @@ serve(async (req) => {
         .from('updates')
         .select('*')
         .order('created_at', { ascending: false })
-        .limit(25);
+        .limit(15);
       updates = fallback.data || [];
       dbError = fallback.error || null;
     }
