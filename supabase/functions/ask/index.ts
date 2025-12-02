@@ -74,34 +74,46 @@ serve(async (req) => {
 
     const sanitizeTsQuery = (q: string) => q.replace(/[':]/g, ' ').trim();
     const tsQuery = sanitizeTsQuery(question);
+    let textSearchSupported = true;
 
     const dateCandidates = parseDates(normalizedQuestion);
 
     let updates: any[] = [];
     let dbError: any = null;
 
+    const tryQuery = async (builder: any) => {
+      const { data, error } = await builder;
+      if (error) throw error;
+      return data || [];
+    };
+
     // Primary: date-specific text search
     if (dateCandidates.length) {
       for (const targetDate of dateCandidates) {
-        let query = supabase
+        const base = supabase
           .from('updates')
           .select('*')
           .eq('date', targetDate)
           .order('created_at', { ascending: false })
           .limit(50);
 
-        if (tsQuery) {
-          query = query.textSearch('search', tsQuery, { type: 'plain', config: 'english' });
-        }
-
-        const { data, error } = await query;
-        if (error) {
-          dbError = error;
-          break;
-        }
-        if (data && data.length > 0) {
-          updates = data;
-          break;
+        try {
+          if (tsQuery && textSearchSupported) {
+            const data = await tryQuery(base.textSearch('search', tsQuery, { type: 'plain', config: 'english' }));
+            if (data.length > 0) {
+              updates = data;
+              break;
+            }
+          } else {
+            const data = await tryQuery(base);
+            if (data.length > 0) {
+              updates = data;
+              break;
+            }
+          }
+        } catch (err: any) {
+          console.error('Date search error:', err?.message || err);
+          textSearchSupported = false; // fallback for subsequent queries
         }
       }
     }
@@ -114,19 +126,34 @@ serve(async (req) => {
         .order('created_at', { ascending: false })
         .limit(50);
 
-      if (tsQuery) {
-        updatesQuery = updatesQuery.textSearch('search', tsQuery, { type: 'plain', config: 'english' });
-      } else if (keywords.length) {
-        const keywordFilters = keywords
-          .slice(0, 6)
-          .map(k => `title.ilike.%${k}%,description.ilike.%${k}%`)
-          .join(',');
-        updatesQuery = updatesQuery.or(keywordFilters);
-      }
+      try {
+        if (tsQuery && textSearchSupported) {
+          const data = await tryQuery(updatesQuery.textSearch('search', tsQuery, { type: 'plain', config: 'english' }));
+          updates = data || updates;
+        }
 
-      const { data, error } = await updatesQuery;
-      updates = data || updates;
-      dbError = error;
+        // If text search not supported or no results, try keyword ilike
+        if ((!updates || updates.length === 0) || !textSearchSupported) {
+          if (keywords.length) {
+            const keywordFilters = keywords
+              .slice(0, 6)
+              .map(k => `title.ilike.%${k}%,description.ilike.%${k}%`)
+              .join(',');
+            const data = await tryQuery(
+              supabase
+                .from('updates')
+                .select('*')
+                .order('created_at', { ascending: false })
+                .limit(50)
+                .or(keywordFilters)
+            );
+            updates = data || updates;
+          }
+        }
+      } catch (error) {
+        console.error('Keyword search error:', error);
+        dbError = error;
+      }
     }
 
     // Fallback: recent updates
@@ -145,22 +172,7 @@ serve(async (req) => {
       throw new Error('Failed to fetch updates');
     }
 
-    // --- Format updates for AI context ---
-    const updatesContext = updates && updates.length > 0
-      ? updates.map(u => 
-          `Date: ${u.date || 'N/A'}\nTime: ${u.time || 'N/A'}\nTitle: ${u.title}\nDescription: ${u.description}\n`
-        ).join('\n---\n')
-      : 'No updates available.';
-
-    const systemPrompt = `You are a helpful business assistant. 
-- Find the most relevant information from the updates below using keyword/semantic matching (be flexible with phrasing). 
-- If nothing is clearly relevant, respond: "No update found for that date or topic."
-
-Updates:
-
-${updatesContext}`;
-
-    // --- Build a simple answer without LLM ---
+    // --- If nothing, return fallback message early ---
     if (!updates || updates.length === 0) {
       return new Response(
         JSON.stringify({ answer: 'No update found for that date or topic.' }),
@@ -168,12 +180,56 @@ ${updatesContext}`;
       );
     }
 
-    const top = updates.slice(0, 15).map((u, idx) => {
-      const dateStr = u.date ? new Date(u.date).toISOString().slice(0, 10) : 'N/A';
-      return `${idx + 1}. ${u.title} (${dateStr} ${u.time || ''})\n${u.description}`;
-    }).join('\n\n');
+    // --- Build context for LLM ---
+    const updatesContext = updates
+      .map(u => {
+        const dateStr = u.date ? new Date(u.date).toISOString().slice(0, 10) : 'N/A';
+        return `Date: ${dateStr}\nTime: ${u.time || 'N/A'}\nTitle: ${u.title}\nDescription: ${u.description}`;
+      })
+      .join('\n---\n');
 
-    const answer = top || 'No update found for that date or topic.';
+    const systemPrompt = `You are a helpful business assistant.
+- Answer ONLY using the updates below.
+- Be concise. If no relevant update exists, reply exactly: "No update found for that date or topic."
+- If multiple updates are relevant, summarize them in bullet points.
+
+Updates:
+
+${updatesContext}`;
+
+    const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY');
+    if (!GEMINI_API_KEY) {
+      console.error('Gemini API key missing');
+      return new Response(
+        JSON.stringify({ error: 'Gemini API key is not configured on the server.' }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // --- Call Gemini ---
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: `${systemPrompt}\n\nUser question: ${question}` }] }],
+          generationConfig: { temperature: 0.4, maxOutputTokens: 500 }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Gemini API error:', errorText);
+      return new Response(
+        JSON.stringify({ error: `Failed to get AI response from Gemini. ${errorText || ''}`.trim() }),
+        { status: response.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const data = await response.json();
+    const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text || 'No update found for that date or topic.';
 
     return new Response(JSON.stringify({ answer }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
