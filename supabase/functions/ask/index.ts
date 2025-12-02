@@ -36,55 +36,30 @@ serve(async (req) => {
 
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // --- Fetch relevant updates (date-aware search with fallback) ---
-    const normalizedQuestion = question.toLowerCase();
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const isTodayQuery = normalizedQuestion.includes('today');
-    const targetDate = isTodayQuery ? todayStr : null;
-
+    // --- Fetch relevant updates (keyword search with fallback) ---
     const keywords = question
       .toLowerCase()
       .split(/[^a-z0-9]+/g)
       .filter(k => k.length > 2);
 
-    let updates: any[] = [];
-    let dbError: any = null;
+    let updatesQuery = supabase
+      .from('updates')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(25);
 
-    // Primary: date-specific query (e.g., "today")
-    if (targetDate) {
-      const { data, error } = await supabase
-        .from('updates')
-        .select('*')
-        .eq('date', targetDate)
-        .order('created_at', { ascending: false })
-        .limit(25);
-      updates = data || [];
-      dbError = error;
+    if (keywords.length) {
+      const keywordFilters = keywords
+        .slice(0, 6) // cap to avoid huge OR clause
+        .map(k => `title.ilike.%${k}%,description.ilike.%${k}%`)
+        .join(',');
+      updatesQuery = updatesQuery.or(keywordFilters);
     }
 
-    // If no date or no results, try keyword search
-    if ((!targetDate || updates.length === 0) && !dbError) {
-      let updatesQuery = supabase
-        .from('updates')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(25);
+    let { data: updates, error: dbError } = await updatesQuery;
 
-      if (keywords.length) {
-        const keywordFilters = keywords
-          .slice(0, 6) // cap to avoid huge OR clause
-          .map(k => `title.ilike.%${k}%,description.ilike.%${k}%`)
-          .join(',');
-        updatesQuery = updatesQuery.or(keywordFilters);
-      }
-
-      const { data, error } = await updatesQuery;
-      updates = data || updates;
-      dbError = error;
-    }
-
-    // Fallback: recent updates
-    if ((!updates || updates.length === 0) && !dbError) {
+    // Fallback: if no matches, return recent updates
+    if (!dbError && (!updates || updates.length === 0)) {
       const fallback = await supabase
         .from('updates')
         .select('*')
@@ -122,7 +97,7 @@ ${updatesContext}`;
       );
     }
 
-    const top = updates.slice(0, 15).map((u, idx) => {
+    const top = updates.slice(0, 5).map((u, idx) => {
       const dateStr = u.date ? new Date(u.date).toISOString().slice(0, 10) : 'N/A';
       return `${idx + 1}. ${u.title} (${dateStr} ${u.time || ''})\n${u.description}`;
     }).join('\n\n');
