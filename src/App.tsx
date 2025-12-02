@@ -40,11 +40,7 @@ const App = () => (
           />
           <Route
             path="/ask"
-            element={
-              <ProtectedRoute>
-                <Ask />
-              </ProtectedRoute>
-            }
+            element={<Ask />}
           />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
